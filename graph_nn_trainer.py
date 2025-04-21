@@ -9,13 +9,11 @@ import matplotlib.pyplot as plt
 import pickle
 from Bio import SeqIO
 import argparse
-from collections import defaultdict
-from torch_geometric.data import Data, Batch
+from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, GATConv
 import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
-import shutil
 from datetime import datetime
+from debruijn import build_debruijn_graph
 
 # ------------- De Bruijn Graph Construction -------------
 
@@ -29,33 +27,6 @@ def read_fasta(file_path):
 def generate_kmers(sequence, k):
     """Generate k-mers from a sequence."""
     return [sequence[i:i+k] for i in range(len(sequence) - k + 1)]
-
-def build_debruijn_graph(sequences, k):
-    """Build a De Bruijn graph from sequences using k-mers."""
-    G = nx.DiGraph()
-    
-    for sequence in sequences:
-        kmers = generate_kmers(sequence, k)
-        
-        # Add edges between (k-1)-mers
-        for i in range(len(kmers) - 1):
-            # For each k-mer, we create an edge from its prefix to its suffix
-            prefix = kmers[i][:-1]
-            suffix = kmers[i][1:]
-            
-            # Add nodes if they don't exist
-            if not G.has_node(prefix):
-                G.add_node(prefix)
-            if not G.has_node(suffix):
-                G.add_node(suffix)
-            
-            # Add edge or increment weight if edge exists
-            if G.has_edge(prefix, suffix):
-                G[prefix][suffix]['weight'] += 1
-            else:
-                G.add_edge(prefix, suffix, weight=1)
-    
-    return G
 
 # ------------- Graph Neural Network Models -------------
 

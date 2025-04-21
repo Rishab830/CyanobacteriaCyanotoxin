@@ -4,8 +4,6 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from Bio import SeqIO
 import argparse
-import sys
-from collections import defaultdict
 
 def read_fasta(file_path):
     """Read sequences from a FASTA file."""
