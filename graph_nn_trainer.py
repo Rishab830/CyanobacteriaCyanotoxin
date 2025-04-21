@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import glob
 import torch
 import numpy as np
 import networkx as nx
@@ -9,12 +10,12 @@ import pickle
 from Bio import SeqIO
 import argparse
 from collections import defaultdict
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GCNConv, GATConv
-from torch_geometric.utils import from_networkx
 import torch.nn.functional as F
-from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
+import shutil
+from datetime import datetime
 
 # ------------- De Bruijn Graph Construction -------------
 
@@ -67,7 +68,7 @@ class GCN(torch.nn.Module):
         self.conv3 = GCNConv(hidden_channels, hidden_channels)
         self.linear = torch.nn.Linear(hidden_channels, num_classes)
     
-    def forward(self, x, edge_index, edge_weight=None):
+    def forward(self, x, edge_index, edge_weight=None, batch=None):
         # First Graph Convolution layer
         x = self.conv1(x, edge_index, edge_weight)
         x = F.relu(x)
@@ -95,7 +96,7 @@ class GAT(torch.nn.Module):
         self.conv2 = GATConv(hidden_channels * heads, hidden_channels, heads=1)
         self.linear = torch.nn.Linear(hidden_channels, num_classes)
     
-    def forward(self, x, edge_index):
+    def forward(self, x, edge_index, batch=None):
         # First Graph Attention layer
         x = self.conv1(x, edge_index)
         x = F.elu(x)
@@ -140,6 +141,14 @@ def prepare_graph_for_gnn(G):
         edge_list.append([node_mapping[u], node_mapping[v]])
         edge_weights.append(data.get('weight', 1.0))
     
+    # Handle empty graphs or graphs with no edges
+    if not edge_list:
+        x = torch.tensor(np.array(node_features), dtype=torch.float)
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_weight = torch.zeros(0, dtype=torch.float)
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_weight)
+        return data, node_mapping
+    
     # Convert to PyTorch tensors
     x = torch.tensor(np.array(node_features), dtype=torch.float)
     edge_index = torch.tensor(np.array(edge_list).T, dtype=torch.long)
@@ -150,69 +159,124 @@ def prepare_graph_for_gnn(G):
     
     return data, node_mapping
 
-def train_model(model, data, num_epochs=200, lr=0.01):
-    """Train the graph neural network model."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
-    criterion = torch.nn.MSELoss()  # Can be changed based on the task
-    
-    model.train()
-    
-    # Create a target based on node centrality
+def calculate_target_values(data):
+    """Calculate target values for graph nodes."""
+    # Create a NetworkX graph from the PyG data
     G_nx = nx.DiGraph()
     edge_index = data.edge_index.numpy()
+    
+    # Handle empty graphs
+    if edge_index.size == 0:
+        return torch.zeros((data.x.size(0), 1), dtype=torch.float)
+    
     for i in range(edge_index.shape[1]):
         G_nx.add_edge(edge_index[0, i], edge_index[1, i])
     
     # Calculate centrality as target
-    centrality = np.array(list(nx.pagerank(G_nx).values()))
-    y = torch.tensor(centrality, dtype=torch.float).view(-1, 1)
+    if G_nx.number_of_nodes() > 0:
+        centrality = np.array(list(nx.pagerank(G_nx).values()))
+        y = torch.tensor(centrality, dtype=torch.float).view(-1, 1)
+    else:
+        # Handle disconnected graphs
+        y = torch.zeros((data.x.size(0), 1), dtype=torch.float)
+    
+    return y
+
+def train_model(model, dataset, num_epochs=200, lr=0.01):
+    """Train the graph neural network model on multiple graphs."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+    criterion = torch.nn.MSELoss()
+    
+    model.train()
+    
+    # Calculate targets for each graph in the dataset
+    targets = [calculate_target_values(data) for data in dataset]
     
     # Training loop
     losses = []
     for epoch in range(num_epochs):
-        optimizer.zero_grad()
+        epoch_loss = 0
         
-        if hasattr(data, 'edge_attr'):
-            out = model(data.x, data.edge_index, data.edge_attr)
-        else:
-            out = model(data.x, data.edge_index)
+        for i, data in enumerate(dataset):
+            optimizer.zero_grad()
+            
+            # Forward pass
+            if hasattr(data, 'edge_attr') and data.edge_attr.size(0) > 0:
+                out = model(data.x, data.edge_index, data.edge_attr)
+            else:
+                out = model(data.x, data.edge_index)
+            
+            # Calculate loss
+            target = targets[i]
+            loss = criterion(out, target)
+            epoch_loss += loss.item()
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
         
-        loss = criterion(out, y)
-        losses.append(loss.item())
-        
-        loss.backward()
-        optimizer.step()
+        avg_loss = epoch_loss / len(dataset)
+        losses.append(avg_loss)
         
         if (epoch + 1) % 20 == 0:
-            print(f'Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.6f}')
+            print(f'Epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.6f}')
     
     return model, losses
 
-def save_graph_and_model(G, model, graph_file, model_file, node_mapping_file):
+def create_output_structure(base_dir):
+    """Create the output directory structure."""
+    # Create timestamp for unique folder name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(base_dir, f"run_{timestamp}")
+    
+    # Create main output directory
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Create subdirectories
+    graphs_dir = os.path.join(out_dir, "graphs")
+    models_dir = os.path.join(out_dir, "models")
+    plots_dir = os.path.join(out_dir, "plots")
+    mappings_dir = os.path.join(out_dir, "mappings")
+    
+    os.makedirs(graphs_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
+    os.makedirs(mappings_dir, exist_ok=True)
+    
+    return {
+        "main": out_dir,
+        "graphs": graphs_dir,
+        "models": models_dir,
+        "plots": plots_dir,
+        "mappings": mappings_dir
+    }
+
+def save_graph_and_model(G, model, node_mapping, file_basename, output_dirs):
     """Save the graph, trained model, and node mapping."""
     # Save the graph
+    graph_file = os.path.join(output_dirs["graphs"], f"{file_basename}_graph.pkl")
     with open(graph_file, 'wb') as f:
         pickle.dump(G, f)
     
     # Save the model
+    model_file = os.path.join(output_dirs["models"], f"{file_basename}_model.pth")
     torch.save(model.state_dict(), model_file)
     
     # Save the node mapping
-    with open(node_mapping_file, 'wb') as f:
+    mapping_file = os.path.join(output_dirs["mappings"], f"{file_basename}_mapping.pkl")
+    with open(mapping_file, 'wb') as f:
         pickle.dump(node_mapping, f)
     
-    print(f"Graph saved to {graph_file}")
-    print(f"Model saved to {model_file}")
-    print(f"Node mapping saved to {node_mapping_file}")
+    return graph_file, model_file, mapping_file
 
-def load_graph_and_model(graph_file, model_file, node_mapping_file, model_class, model_params):
+def load_graph_and_model(graph_file, model_file, mapping_file, model_class, model_params):
     """Load the graph, trained model, and node mapping."""
     # Load the graph
     with open(graph_file, 'rb') as f:
         G = pickle.load(f)
     
     # Load the node mapping
-    with open(node_mapping_file, 'rb') as f:
+    with open(mapping_file, 'rb') as f:
         node_mapping = pickle.load(f)
     
     # Initialize the model with the same parameters
@@ -222,7 +286,7 @@ def load_graph_and_model(graph_file, model_file, node_mapping_file, model_class,
     
     return G, model, node_mapping
 
-def visualize_training(losses, output_file=None):
+def visualize_training(losses, output_file):
     """Visualize the training loss."""
     plt.figure(figsize=(10, 6))
     plt.plot(losses)
@@ -231,19 +295,22 @@ def visualize_training(losses, output_file=None):
     plt.ylabel('Loss')
     plt.grid(True)
     
-    if output_file:
-        plt.savefig(output_file, format='png', dpi=300)
-        print(f"Training loss plot saved to {output_file}")
-    else:
-        plt.show()
+    plt.savefig(output_file, format='png', dpi=300)
+    plt.close()
+    print(f"Training loss plot saved to {output_file}")
 
-def visualize_graph_with_predictions(G, model, data, node_mapping, output_file=None):
+def visualize_graph_with_predictions(G, model, data, node_mapping, output_file):
     """Visualize the graph with node predictions from the model."""
     model.eval()
     
+    # Check if graph is empty
+    if G.number_of_nodes() == 0:
+        print(f"Cannot visualize empty graph for {output_file}")
+        return
+    
     # Get model predictions
     with torch.no_grad():
-        if hasattr(data, 'edge_attr'):
+        if hasattr(data, 'edge_attr') and data.edge_attr.size(0) > 0:
             pred = model(data.x, data.edge_index, data.edge_attr)
         else:
             pred = model(data.x, data.edge_index)
@@ -256,33 +323,59 @@ def visualize_graph_with_predictions(G, model, data, node_mapping, output_file=N
     
     # Visualize graph
     plt.figure(figsize=(12, 10))
-    pos = nx.spring_layout(G, seed=42)
     
-    # Draw nodes with color based on predictions
-    node_colors = [node_predictions[node] for node in G.nodes()]
-    nodes = nx.draw_networkx_nodes(G, pos, node_size=500, node_color=node_colors, cmap=plt.cm.viridis)
-    
-    # Draw edges
-    nx.draw_networkx_edges(G, pos, width=1.0, alpha=0.7, arrows=True, arrowsize=15)
-    
-    # Draw node labels
-    nx.draw_networkx_labels(G, pos, font_size=8, font_family='sans-serif')
-    
-    plt.colorbar(nodes, label='Model Prediction')
-    plt.axis('off')
-    plt.tight_layout()
-    
-    if output_file:
+    try:
+        pos = nx.spring_layout(G, seed=42)
+        
+        # Draw nodes with color based on predictions
+        node_colors = [node_predictions[node] for node in G.nodes()]
+        nodes = nx.draw_networkx_nodes(G, pos, node_size=500, node_color=node_colors, cmap=plt.cm.viridis)
+        
+        # Draw edges
+        nx.draw_networkx_edges(G, pos, width=1.0, alpha=0.7, arrows=True, arrowsize=15)
+        
+        # Draw node labels only if there are fewer than 50 nodes (for readability)
+        if G.number_of_nodes() < 50:
+            nx.draw_networkx_labels(G, pos, font_size=8, font_family='sans-serif')
+        
+        plt.colorbar(nodes, label='Model Prediction')
+        plt.axis('off')
+        plt.tight_layout()
+        
         plt.savefig(output_file, format='png', dpi=300)
-        print(f"Graph visualization with predictions saved to {output_file}")
-    else:
-        plt.show()
+        plt.close()
+        print(f"Graph visualization saved to {output_file}")
+    except Exception as e:
+        print(f"Error visualizing graph: {str(e)}")
+
+def save_run_info(output_dir, args, file_list, num_graphs):
+    """Save information about the run to a text file."""
+    info_file = os.path.join(output_dir, "run_info.txt")
+    
+    with open(info_file, 'w') as f:
+        f.write("De Bruijn Graph Neural Network Training Run\n")
+        f.write("==========================================\n\n")
+        f.write(f"Date and Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("Parameters:\n")
+        for arg, value in vars(args).items():
+            f.write(f"  {arg}: {value}\n")
+        
+        f.write(f"\nNumber of FASTA files processed: {len(file_list)}\n")
+        f.write(f"Number of graphs generated: {num_graphs}\n")
+        
+        f.write("\nFASTA files:\n")
+        for i, file_path in enumerate(file_list, 1):
+            f.write(f"  {i}. {os.path.basename(file_path)}\n")
+    
+    print(f"Run information saved to {info_file}")
 
 # ------------- Main Function -------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Train a GNN on a De Bruijn graph from FASTA sequences.')
-    parser.add_argument('-f', '--fasta', help='Path to FASTA file')
+    parser = argparse.ArgumentParser(description='Train a GNN on multiple De Bruijn graphs from FASTA files.')
+    parser.add_argument('-d', '--fasta_dir', help='Directory containing FASTA files')
+    parser.add_argument('-f', '--fasta', help='Single FASTA file (alternative to directory)')
     parser.add_argument('-k', '--kmer', type=int, default=3, help='k-mer size (default: 3)')
     parser.add_argument('-m', '--model', type=str, default='gcn', choices=['gcn', 'gat'], 
                         help='GNN model to use (default: gcn)')
@@ -290,27 +383,49 @@ def main():
     parser.add_argument('-l', '--learning_rate', type=float, default=0.01, help='Learning rate (default: 0.01)')
     parser.add_argument('-hc', '--hidden_channels', type=int, default=64, 
                         help='Number of hidden channels in GNN (default: 64)')
-    parser.add_argument('-o', '--output_dir', default='output', help='Output directory (default: output)')
+    parser.add_argument('-o', '--output_dir', default='output', help='Base output directory (default: output)')
     parser.add_argument('--load', action='store_true', help='Load saved graph and model instead of creating new ones')
-    parser.add_argument('--graph_file', default='output/debruijn_graph.pkl', help='File to save/load graph')
-    parser.add_argument('--model_file', default='output/gnn_model.pth', help='File to save/load model')
-    parser.add_argument('--mapping_file', default='output/node_mapping.pkl', help='File to save/load node mapping')
+    parser.add_argument('--run_dir', help='Directory of a previous run to load from')
     
     args = parser.parse_args()
     
-    # Create output directory if it doesn't exist
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Check for valid input
+    if not args.load and not args.fasta_dir and not args.fasta:
+        print("Error: Either --fasta_dir, --fasta, or --load with --run_dir must be specified.")
+        return
+    
+    if args.load and not args.run_dir:
+        print("Error: --run_dir must be specified when using --load.")
+        return
+    
+    # Create output directory structure
+    output_dirs = create_output_structure(args.output_dir)
+    print(f"Created output directory structure at {output_dirs['main']}")
     
     try:
         if args.load:
-            # Load existing graph and model
-            print(f"Loading graph from {args.graph_file} and model from {args.model_file}...")
+            # Load existing graphs and models
+            print(f"Loading graphs and model from {args.run_dir}...")
             
-            # Determine model parameters based on the saved model file name
-            model_class = GCN if 'gcn' in args.model_file.lower() else GAT
+            # Find all graph files
+            graph_files = glob.glob(os.path.join(args.run_dir, "graphs", "*_graph.pkl"))
             
-            # For simplicity, we'll use default parameters
-            # In a real-world scenario, you would save and load these parameters as well
+            if not graph_files:
+                print(f"No graph files found in {os.path.join(args.run_dir, 'graphs')}")
+                return
+            
+            # Load the first model to get the model class
+            model_type = 'gcn' if 'gcn' in args.model.lower() else 'gat'
+            model_files = glob.glob(os.path.join(args.run_dir, "models", f"*_{model_type}_model.pth"))
+            
+            if not model_files:
+                print(f"No model files found in {os.path.join(args.run_dir, 'models')}")
+                return
+            
+            # Determine model parameters
+            model_class = GCN if model_type == 'gcn' else GAT
+            
+            # Default parameters
             model_params = {
                 'num_node_features': 5 * (args.kmer - 1),  # For k-mers of length k-1
                 'hidden_channels': args.hidden_channels,
@@ -320,74 +435,156 @@ def main():
             if model_class == GAT:
                 model_params['heads'] = 8
             
-            G, model, node_mapping = load_graph_and_model(
-                args.graph_file, args.model_file, args.mapping_file, model_class, model_params
-            )
+            # Load each graph and its corresponding model
+            graphs = []
+            models = []
+            node_mappings = []
             
-            # Convert graph to PyG data
-            data, _ = prepare_graph_for_gnn(G)
+            for graph_file in graph_files:
+                base_name = os.path.basename(graph_file).replace("_graph.pkl", "")
+                model_file = os.path.join(args.run_dir, "models", f"{base_name}_model.pth")
+                mapping_file = os.path.join(args.run_dir, "mappings", f"{base_name}_mapping.pkl")
+                
+                if os.path.exists(model_file) and os.path.exists(mapping_file):
+                    G, model, node_mapping = load_graph_and_model(
+                        graph_file, model_file, mapping_file, model_class, model_params
+                    )
+                    graphs.append(G)
+                    models.append(model)
+                    node_mappings.append(node_mapping)
+                    print(f"Loaded graph and model for {base_name}")
+                else:
+                    print(f"Missing files for {base_name}, skipping...")
+            
+            # Convert graphs to PyG data
+            dataset = []
+            for G in graphs:
+                data, _ = prepare_graph_for_gnn(G)
+                dataset.append(data)
+            
+            print(f"Loaded {len(graphs)} graphs and models")
             
         else:
-            # Create new graph and train model
-            if not args.fasta:
-                print("Error: FASTA file is required when not loading an existing graph.")
+            # Create new graphs and train model
+            fasta_files = []
+            
+            if args.fasta_dir:
+                # Get all FASTA files in the directory
+                fasta_files = glob.glob(os.path.join(args.fasta_dir, "*.fasta")) + \
+                              glob.glob(os.path.join(args.fasta_dir, "*.fa")) + \
+                              glob.glob(os.path.join(args.fasta_dir, "*.fna")) + \
+                              glob.glob(os.path.join(args.fasta_dir, "*.txt"))
+            elif args.fasta:
+                fasta_files = [args.fasta]
+            
+            if not fasta_files:
+                print("No FASTA files found.")
                 return
             
-            # Read sequences and build graph
-            print(f"Reading sequences from {args.fasta}...")
-            sequences = read_fasta(args.fasta)
-            if not sequences:
-                print("No sequences found in the FASTA file.")
+            print(f"Found {len(fasta_files)} FASTA files")
+            
+            # Save list of FASTA files for reference
+            save_run_info(output_dirs["main"], args, fasta_files, len(fasta_files))
+            
+            # Process each FASTA file
+            graphs = []
+            node_mappings = []
+            dataset = []
+            file_basenames = []
+            
+            for fasta_file in fasta_files:
+                file_basename = os.path.splitext(os.path.basename(fasta_file))[0]
+                file_basenames.append(file_basename)
+                
+                print(f"Processing {file_basename}...")
+                
+                # Read sequences and build graph
+                sequences = read_fasta(fasta_file)
+                if not sequences:
+                    print(f"No sequences found in {file_basename}, skipping...")
+                    continue
+                
+                print(f"Building De Bruijn graph for {file_basename} with k={args.kmer}...")
+                G = build_debruijn_graph(sequences, args.kmer)
+                print(f"Created graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+                
+                # Store graph
+                graphs.append(G)
+                
+                # Prepare graph for GNN
+                data, node_mapping = prepare_graph_for_gnn(G)
+                dataset.append(data)
+                node_mappings.append(node_mapping)
+            
+            if not graphs:
+                print("No valid graphs were created from the FASTA files.")
                 return
-            
-            print(f"Building De Bruijn graph with k={args.kmer}...")
-            G = build_debruijn_graph(sequences, args.kmer)
-            print(f"Created graph with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
-            
-            # Prepare graph for GNN
-            print("Converting graph to PyTorch Geometric format...")
-            data, node_mapping = prepare_graph_for_gnn(G)
             
             # Create and train the model
             print(f"Creating {args.model.upper()} model...")
-            num_node_features = data.x.size(1)
+            
+            # Determine feature size from the first graph's data
+            num_node_features = dataset[0].x.size(1)
             
             if args.model.lower() == 'gcn':
                 model = GCN(num_node_features=num_node_features, 
-                           hidden_channels=args.hidden_channels, 
-                           num_classes=1)  # Predicting one value per node
+                          hidden_channels=args.hidden_channels, 
+                          num_classes=1)
             else:  # GAT
                 model = GAT(num_node_features=num_node_features, 
-                           hidden_channels=args.hidden_channels, 
-                           num_classes=1,
-                           heads=8)
+                          hidden_channels=args.hidden_channels, 
+                          num_classes=1,
+                          heads=8)
             
-            print(f"Training model for {args.epochs} epochs...")
-            model, losses = train_model(model, data, num_epochs=args.epochs, lr=args.learning_rate)
+            print(f"Training model on {len(dataset)} graphs for {args.epochs} epochs...")
+            model, losses = train_model(model, dataset, num_epochs=args.epochs, lr=args.learning_rate)
             
-            # Save graph and model
-            print("Saving graph and model...")
-            graph_file = os.path.join(args.output_dir, 'debruijn_graph.pkl')
-            model_file = os.path.join(args.output_dir, f'{args.model}_model.pth')
-            mapping_file = os.path.join(args.output_dir, 'node_mapping.pkl')
+            # Save all graphs and the trained model
+            print("Saving graphs and model...")
             
-            save_graph_and_model(G, model, graph_file, model_file, mapping_file)
+            for i, (G, node_mapping) in enumerate(zip(graphs, node_mappings)):
+                file_basename = file_basenames[i] if i < len(file_basenames) else f"graph_{i}"
+                model_type = args.model.lower()
+                
+                graph_file, model_file, mapping_file = save_graph_and_model(
+                    G, model, node_mapping, f"{file_basename}_{model_type}", output_dirs
+                )
             
             # Plot training loss
-            loss_plot_file = os.path.join(args.output_dir, 'training_loss.png')
+            loss_plot_file = os.path.join(output_dirs["plots"], "training_loss.png")
             visualize_training(losses, loss_plot_file)
+            
+            # Save the final combined model separately
+            final_model_file = os.path.join(output_dirs["models"], f"combined_{args.model}_model.pth")
+            torch.save(model.state_dict(), final_model_file)
+            print(f"Combined model saved to {final_model_file}")
         
-        # Visualize graph with predictions
-        print("Visualizing graph with model predictions...")
-        viz_file = os.path.join(args.output_dir, 'graph_predictions.png')
-        visualize_graph_with_predictions(G, model, data, node_mapping, viz_file)
+        # Visualize all graphs with predictions
+        print("Visualizing graphs with model predictions...")
         
-        print("Done!")
+        for i, (G, data, node_mapping) in enumerate(zip(graphs, dataset, node_mappings)):
+            try:
+                file_basename = file_basenames[i] if 'file_basenames' in locals() and i < len(file_basenames) else f"graph_{i}"
+                viz_file = os.path.join(output_dirs["plots"], f"{file_basename}_prediction.png")
+                
+                # Use the last trained model (or the loaded model if in load mode)
+                if args.load:
+                    current_model = models[i]
+                else:
+                    current_model = model
+                
+                visualize_graph_with_predictions(G, current_model, data, node_mapping, viz_file)
+            except Exception as e:
+                print(f"Error visualizing graph {i}: {str(e)}")
+        
+        print(f"Processing complete! All outputs saved to {output_dirs['main']}")
         
     except FileNotFoundError as e:
         print(f"Error: {str(e)}")
     except Exception as e:
         print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
