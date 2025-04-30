@@ -347,7 +347,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train a GNN on multiple De Bruijn graphs from FASTA files.')
     parser.add_argument('-d', '--fasta_dir', help='Directory containing FASTA files')
     parser.add_argument('-f', '--fasta', help='Single FASTA file (alternative to directory)')
-    parser.add_argument('-k', '--kmer', type=int, default=3, help='k-mer size (default: 3)')
+    parser.add_argument('-k', '--kmer', type=int, default=5, help='k-mer size (default: 5)')
     parser.add_argument('-m', '--model', type=str, default='gcn', choices=['gcn', 'gat'], 
                         help='GNN model to use (default: gcn)')
     parser.add_argument('-e', '--epochs', type=int, default=200, help='Number of training epochs (default: 200)')

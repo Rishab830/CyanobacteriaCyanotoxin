@@ -2,12 +2,12 @@ Classification Report for Sequence: sequence_1
 ==================================================
 
 Best Match: anatoxin
-Confidence Score: 0.7100
+Confidence Score: 0.5183
 
 All Similarity Scores:
 ------------------------------
-anatoxin: 0.7100
-Microcystin: 0.7100
-saxitoxin: 0.7100
-Cylindrospermopsin: 0.7100
-nodularin: 0.7100
+anatoxin: 0.5183
+Microcystin: 0.5183
+nodularin: 0.5141
+Cylindrospermopsin: 0.4494
+saxitoxin: 0.4481

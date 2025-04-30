@@ -681,7 +681,7 @@ if __name__ == "__main__":
     parser.add_argument('-m', '--models_dir', type=str, default='models', help='Directory containing pre-trained models and graphs')
     parser.add_argument('-o', '--output_dir', type=str, default='results', help='Directory to save results')
     parser.add_argument('-s', '--sequence_file', type=str, default='', help='FASTA file containing sequences to classify')
-    parser.add_argument('-k', '--kmer_size', type=int, default=3, help='Size of k-mers for De Bruijn graph construction')
+    parser.add_argument('-k', '--kmer_size', type=int, default=5, help='Size of k-mers for De Bruijn graph construction')
     
     args = parser.parse_args()
     

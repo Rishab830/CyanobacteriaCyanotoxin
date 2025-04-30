@@ -1,0 +1,26 @@
+De Bruijn Graph Neural Network Training Run
+==========================================
+
+Date and Time: 2025-04-28 09:34:05
+
+Parameters:
+  fasta_dir: gene_dataset
+  fasta: None
+  kmer: 5
+  model: gcn
+  epochs: 200
+  learning_rate: 0.01
+  hidden_channels: 64
+  output_dir: output
+  load: False
+  run_dir: None
+
+Number of FASTA files processed: 5
+Number of graphs generated: 5
+
+FASTA files:
+  1. Microcystin.fasta
+  2. Cylindrospermopsin.fasta
+  3. saxitoxin.fasta
+  4. nodularin.fasta
+  5. anatoxin.fasta

@@ -266,7 +266,7 @@ def write_classification_report(sequence_name, results, output_dir):
 def main():
     parser = argparse.ArgumentParser(description='Classify gene sequences to identify cyanotoxin genes using trained GNN models.')
     parser.add_argument('-s', '--sequence', help='File containing the sequence to classify (FASTA format)')
-    parser.add_argument('-k', '--kmer', type=int, default=3, help='k-mer size (default: 3)')
+    parser.add_argument('-k', '--kmer', type=int, default=5, help='k-mer size (default: 5)')
     parser.add_argument('-m', '--input_dir', required=True, help='Directory containing saved GNN models')
     parser.add_argument('-o', '--output_dir', default='classification_results', help='Output directory for results')
     
